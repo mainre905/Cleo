@@ -49,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -57,6 +59,26 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define IMU_SPI_CSn_Pin GPIO_PIN_3
+#define IMU_SPI_CSn_GPIO_Port GPIOE
+#define WPT_PWM_BOT_Pin GPIO_PIN_0
+#define WPT_PWM_BOT_GPIO_Port GPIOA
+#define IMU_SPI_SCK_Pin GPIO_PIN_5
+#define IMU_SPI_SCK_GPIO_Port GPIOA
+#define MOT_SPD_Pin GPIO_PIN_9
+#define MOT_SPD_GPIO_Port GPIOE
+#define MOT_BRAKE_Pin GPIO_PIN_13
+#define MOT_BRAKE_GPIO_Port GPIOE
+#define IMU_SPI_MOSI_Pin GPIO_PIN_7
+#define IMU_SPI_MOSI_GPIO_Port GPIOD
+#define WPT_PWM_TOP_Pin GPIO_PIN_3
+#define WPT_PWM_TOP_GPIO_Port GPIOB
+#define IMU_SPI_MISO_Pin GPIO_PIN_4
+#define IMU_SPI_MISO_GPIO_Port GPIOB
+#define MOT_I2C_SCL_Pin GPIO_PIN_6
+#define MOT_I2C_SCL_GPIO_Port GPIOB
+#define MOT_I2C_SDA_Pin GPIO_PIN_7
+#define MOT_I2C_SDA_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
