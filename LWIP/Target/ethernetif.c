@@ -163,6 +163,20 @@ static uint8_t TxScratch[ETH_TX_SCRATCH_SIZE] __ALIGNED(32);
 ETH_HandleTypeDef heth;
 ETH_TxPacketConfigTypeDef TxConfig;
 
+/* Regeneration canary - deliberately NOT inside a USER CODE section.
+ *
+ * Most of this file's customization (the forced 100M/FDX MAC config, the
+ * checksum settings, HAL_ETH_Start, the empty link check) lives in generated
+ * regions that CubeMX overwrites, because its LAN8742 template has no hooks
+ * there. If this file is regenerated, this definition disappears, the
+ * reference to it in Core/Src/gsw145.c stops resolving, and the build fails
+ * with an undefined reference.
+ *
+ * That is the point: a loud link error beats silently reverting to PHY
+ * polling on a board that has no PHY. To recover, restore this file from git
+ * and re-run tools/check_after_cubemx.sh. */
+const uint32_t Cleo_EthernetifIsCustomized = 1U;
+
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN 3 */
 

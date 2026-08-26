@@ -134,6 +134,15 @@ void MX_LWIP_Init(void)
 static void Ethernet_Link_Periodic_Handle(struct netif *netif)
 {
 /* USER CODE BEGIN 4_4_1 */
+  /* This board has no PHY - port 5 of the GSW145 is wired straight to the RMII
+     pins - so there is no link state to poll. The customized
+     ethernet_link_check_state() is already a no-op, but blocking the call here
+     as well is what survives a CubeMX regeneration: this marker is part of the
+     stock template, whereas the body of ethernet_link_check_state() is not.
+     Without this, a regenerated ethernetif.c would poll a non-existent LAN8742,
+     read 0xFFFF as "link down", and tear the interface down every 100 ms. */
+  LWIP_UNUSED_ARG(netif);
+  return;
 /* USER CODE END 4_4_1 */
 
   /* Ethernet Link every 100ms */

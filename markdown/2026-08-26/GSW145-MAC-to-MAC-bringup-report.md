@@ -494,6 +494,103 @@ STM32CubeCLT 1.20.0의 `arm-none-eabi-gcc`로 실제 빌드하여 검증했다.
 
 ---
 
+## 10.4 CubeMX 재생성 대응 ⚠️
+
+### 문제
+
+CubeMX가 생성하는 `ethernetif.c` 템플릿에는 USER CODE 마커가 **19개**뿐이며,
+다음 위치에는 **훅이 존재하지 않는다.**
+
+- `low_level_init()`의 PHY 초기화 이후 구간 (MAC 속도/듀플렉스/체크섬 설정)
+- `low_level_output()` / `low_level_input()` / `ethernetif_input()`
+- `ethernet_link_check_state()` 본문
+- 파일 상단의 `#include "lan8742.h"` 및 LAN8742 객체 선언
+
+따라서 **`ethernetif.c`는 USER CODE 섹션만으로는 재생성으로부터 보호할 수 없다.**
+재생성하면 다음이 복구되어 이더넷이 동작하지 않는다.
+
+| 되돌아가는 것 | 결과 |
+|---|---|
+| `ethernet_link_check_state()` LAN8742 폴링 | PHY가 없어 0xFFFF 읽음 → **100ms마다 링크 다운** |
+| `LAN8742_Init()` 실패 시 early return | `HAL_ETH_Start()` 미실행 → **인터페이스 사망** |
+| MAC 속도/듀플렉스 강제 설정 | 링크 파라미터 불일치 |
+| `DropTCPIPChecksumErrorPacket = DISABLE` | RX 프레임 조용히 폐기 |
+| `TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE` | 소프트웨어 체크섬 위에 덮어씀 |
+| MAC 주소 `02:...` → `00:80:E1:00:00:00` | - |
+
+`USER CODE BEGIN LOW_LEVEL_INIT`은 함수 끝에 있지만, 그 앞의 `LAN8742_Init()` 실패
+경로가 `return`으로 빠져나가므로 **도달하지 못한다.**
+
+### 대응 1 — 링크 타임 canary (빌드 실패로 알림)
+
+`ethernetif.c`의 **USER CODE 밖**에 마커 심볼을 정의하고, CubeMX가 건드리지 않는
+`gsw145.c`에서 이를 참조한다.
+
+```c
+/* LWIP/Target/ethernetif.c - USER CODE 밖 */
+const uint32_t Cleo_EthernetifIsCustomized = 1U;
+
+/* Core/Src/gsw145.c - GSW145_Init() 내부 */
+if (Cleo_EthernetifIsCustomized != 1U) { return HAL_ERROR; }
+```
+
+재생성되면 정의가 사라지고 링크가 실패한다.
+
+**실제 검증** — CubeMX 동작(생성 영역은 템플릿으로 복원, USER CODE는 이월)을
+스크립트로 재현하여 확인했다.
+
+```
+USER CODE blocks carried over : Header, 0, 1, 2, 4, MACADDRESS,
+                                PHY_PRE_CONFIG, 6, HAL ETH Rx/Tx callbacks
+blocks LOST (no such marker)  : ETHERNETIF_INPUT, ETHERNET_LINK_CHECK_STATE
+
+$ arm-none-eabi-gcc ... -o regen.elf
+gsw145.c:(.text.GSW145_Init+0x134): undefined reference to `Cleo_EthernetifIsCustomized'
+collect2.exe: error: ld returned 1 exit status
+```
+
+조용히 잘못 동작하는 대신 **빌드가 멈춘다.** 복구는 `git checkout -- LWIP/Target/ethernetif.c`.
+
+> 주의: `MACADDRESS` 훅(= `GSW145_Init()` 호출부)은 USER CODE라 재생성 후에도 남는다.
+> 이것이 canary 참조를 살려두므로 `--gc-sections`에도 제거되지 않는다.
+
+### 대응 2 — 링크 폴링을 `lwip.c`에서 영구 차단
+
+가장 위험한 되돌림(100ms마다 링크 다운)은 **실제로 존재하는 마커**로 막았다.
+
+```c
+/* LWIP/App/lwip.c - Ethernet_Link_Periodic_Handle() */
+/* USER CODE BEGIN 4_4_1 */
+  LWIP_UNUSED_ARG(netif);
+  return;                       /* ethernet_link_check_state()를 아예 호출하지 않음 */
+/* USER CODE END 4_4_1 */
+```
+
+`ethernetif.c`가 어떤 상태든 LAN8742 폴링은 실행되지 않는다.
+
+### 대응 3 — 재생성 후 검사 스크립트
+
+```sh
+sh tools/check_after_cubemx.sh
+```
+
+CubeMX가 덮어쓸 수 있는 모든 항목을 검사한다 — `lwipopts.h`의 체크섬/힙 주소,
+두 링커 스크립트의 `.lwip_sec` 블록, `ethernetif.c`의 커스터마이징 흔적,
+`lwip.c`의 정적 IP와 링크 폴링 차단. 실패 시 각 항목의 복구 방법을 출력한다.
+
+### 권장 워크플로
+
+```
+1. CubeMX에서 Generate Code
+2. sh tools/check_after_cubemx.sh
+3. BROKEN 항목이 있으면 안내대로 복구
+     ethernetif.c → git checkout -- LWIP/Target/ethernetif.c
+     lwipopts.h   → CubeMX GUI 값 확인 후 재생성
+4. 빌드 (canary가 남은 누락을 링크 에러로 잡아냄)
+```
+
+---
+
 ## 11. 알려진 한계
 
 | 항목 | 내용 |

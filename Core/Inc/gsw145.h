@@ -24,6 +24,14 @@ extern "C" {
 #include "stm32h7xx_hal.h"
 
 /**
+  * @brief  Defined in LWIP/Target/ethernetif.c, outside every USER CODE
+  *         section, so that a CubeMX regeneration of that file breaks the
+  *         link instead of silently restoring the LAN8742 PHY template.
+  *         GSW145_Init() references it to force that link dependency.
+  */
+extern const uint32_t Cleo_EthernetifIsCustomized;
+
+/**
   * @brief  Configure the switch for a fixed 100 Mbps full-duplex RMII link on
   *         port 5, with the switch driving the reference clock.
   *
