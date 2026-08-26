@@ -154,6 +154,21 @@ SECTIONS
     __bss_end__ = _ebss;
   } >DTCMRAM
 
+  /* Ethernet DMA regions - see the matching block in STM32H750VBTX_FLASH.ld.
+     Note .bss lives in DTCM here, which the ETH DMA cannot reach at all, so
+     placing these sections in D2 SRAM explicitly is mandatory for this build. */
+  .lwip_sec (NOLOAD) :
+  {
+    . = ABSOLUTE(0x30000000);
+    *(.RxDecripSection)
+
+    . = ABSOLUTE(0x30000100);
+    *(.TxDecripSection)
+
+    . = ABSOLUTE(0x30000200);
+    *(.Rx_PoolSection)
+  } >RAM_D2
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :
   {

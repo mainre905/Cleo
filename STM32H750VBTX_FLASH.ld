@@ -155,6 +155,30 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM_D1
 
+  /* Ethernet DMA regions.
+     The ETH DMA lives in the D2 domain and cannot reach DTCM, so the DMA
+     descriptors and the zero-copy RX pbuf pool must be placed in D2 SRAM.
+     Without this block these sections are orphans and the linker places them
+     wherever it likes - reception then fails in ways that look random.
+
+     D2 SRAM map (0x30000000, 288K):
+       0x30000000  RX DMA descriptors
+       0x30000100  TX DMA descriptors
+       0x30000200  RX pbuf pool (12 * ~1568 B = ~19 KB)
+       0x30008000  LwIP heap - see LWIP_RAM_HEAP_POINTER in lwipopts.h
+     Keep this map and LWIP_RAM_HEAP_POINTER in sync. */
+  .lwip_sec (NOLOAD) :
+  {
+    . = ABSOLUTE(0x30000000);
+    *(.RxDecripSection)
+
+    . = ABSOLUTE(0x30000100);
+    *(.TxDecripSection)
+
+    . = ABSOLUTE(0x30000200);
+    *(.Rx_PoolSection)
+  } >RAM_D2
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :
   {

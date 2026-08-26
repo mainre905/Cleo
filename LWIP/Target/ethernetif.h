@@ -41,5 +41,15 @@ u32_t sys_now(void);
 
 /* USER CODE BEGIN 1 */
 
+/**
+  * @brief  Bring up just enough of the ETH peripheral to drive MDIO.
+  *
+  * Must be called before MX_LWIP_Init(). It enables the ETH clocks, configures
+  * the RMII pins and sets the MDC divider, so the GSW145 can be programmed over
+  * MDIO while HAL_ETH_Init() has not run yet. This is what lets the switch start
+  * its 50 MHz RMII reference clock before HAL_ETH_Init() waits on the DMA reset.
+  */
+void ethernetif_PreInitMDIO(void);
+
 /* USER CODE END 1 */
 #endif

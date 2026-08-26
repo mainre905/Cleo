@@ -22,7 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "lwip/netif.h"
+#include "lwip/udp.h"
+#include "lwip/ip_addr.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,6 +36,16 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* UDP bring-up test. The local address is set in LWIP/App/lwip.c
+   (USER CODE BEGIN IP_ADDRESSES); the peer must be on the same subnet so that
+   normal ARP can resolve it. */
+#define UDP_PEER_ADDR0            192
+#define UDP_PEER_ADDR1            168
+#define UDP_PEER_ADDR2            1
+#define UDP_PEER_ADDR3            2
+#define UDP_PEER_PORT             8000U
+#define UDP_SEND_INTERVAL_MS      1000U
 
 /* USER CODE END PD */
 
@@ -52,6 +66,11 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
+extern struct netif gnetif;   /* defined in LWIP/App/lwip.c */
+
+static struct udp_pcb *g_udp_pcb;
+static ip_addr_t       g_peer_ip;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +86,78 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+  * @brief  Retarget printf to USART1. Overrides the weak _write in syscalls.c.
+  */
+int _write(int file, char *ptr, int len)
+{
+  (void)file;
+  HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, 100U);
+  return len;
+}
+
+/**
+  * @brief  Create the UDP socket used by the bring-up test.
+  *
+  * No static ARP entry is installed. With a real local address on the same
+  * subnet (see LWIP/App/lwip.c) the switch forwards the ARP broadcast and the
+  * peer answers normally, which also means a peer that reboots or changes NIC
+  * still works - unlike a hard-coded MAC.
+  */
+static void UDP_Test_Init(void)
+{
+  g_udp_pcb = udp_new();
+  if (g_udp_pcb == NULL)
+  {
+    printf("[UDP] udp_new failed\r\n");
+    return;
+  }
+
+  IP4_ADDR(ip_2_ip4(&g_peer_ip), UDP_PEER_ADDR0, UDP_PEER_ADDR1,
+           UDP_PEER_ADDR2, UDP_PEER_ADDR3);
+
+  if (udp_connect(g_udp_pcb, &g_peer_ip, UDP_PEER_PORT) != ERR_OK)
+  {
+    printf("[UDP] udp_connect failed\r\n");
+    udp_remove(g_udp_pcb);
+    g_udp_pcb = NULL;
+  }
+}
+
+/**
+  * @brief  Send one test datagram, reporting what actually happened.
+  */
+static void UDP_Test_Send(void)
+{
+  static const char msg[] = "hello world_samsung\r\n";
+  struct pbuf *p;
+  err_t err;
+
+  if ((g_udp_pcb == NULL) || !netif_is_link_up(&gnetif) || !netif_is_up(&gnetif))
+  {
+    return;
+  }
+
+  p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(sizeof(msg) - 1U), PBUF_RAM);
+  if (p == NULL)
+  {
+    printf("[UDP] pbuf_alloc failed\r\n");
+    return;
+  }
+
+  memcpy(p->payload, msg, sizeof(msg) - 1U);
+  err = udp_send(g_udp_pcb, p);
+  pbuf_free(p);
+
+  /* Report the result rather than assuming it. udp_send() returning ERR_OK
+     means the frame reached the MAC, not that the peer received it - confirm
+     that on the peer (Wireshark or a listening socket). */
+  if (err != ERR_OK)
+  {
+    printf("[UDP] send failed, err=%d\r\n", (int)err);
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -106,15 +197,37 @@ int main(void)
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
 
+  /* The GSW145 is brought up from inside MX_LWIP_Init(), in the MACADDRESS hook
+     of LWIP/Target/ethernetif.c, because it has to happen before HAL_ETH_Init().
+     Its progress is already on the console by this point. */
+  printf("\r\n=== STM32H750 + GSW145 MAC-to-MAC ===\r\n");
+  printf("[NET] ip=%s link=%s\r\n",
+         ip4addr_ntoa(netif_ip4_addr(&gnetif)),
+         netif_is_link_up(&gnetif) ? "up" : "DOWN");
+
+  UDP_Test_Init();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t udp_tick = HAL_GetTick();
+
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    /* Drains the RX DMA, runs the LwIP timers, and calls
+       ethernet_link_check_state() every 100 ms (a no-op on this board). */
+    MX_LWIP_Process();
+
+    if ((HAL_GetTick() - udp_tick) >= UDP_SEND_INTERVAL_MS)
+    {
+      udp_tick = HAL_GetTick();
+      UDP_Test_Send();
+    }
   }
   /* USER CODE END 3 */
 }

@@ -41,8 +41,15 @@
 /* Parameters set in STM32CubeMX LwIP Configuration GUI -*/
 /*----- WITH_RTOS disabled (Since FREERTOS is not set) -----*/
 #define WITH_RTOS 0
-/*----- CHECKSUM_BY_HARDWARE enabled -----*/
-#define CHECKSUM_BY_HARDWARE 1
+/*----- CHECKSUM_BY_HARDWARE disabled -----*/
+/* MAC-to-MAC link to the GSW145: the MAC checksum offload is switched off in
+   both directions (TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE and
+   MACConf.DropTCPIPChecksumErrorPacket = DISABLE in ethernetif.c), so LwIP
+   computes and verifies every checksum in software - see CHECKSUM_GEN_* /
+   CHECKSUM_CHECK_* below, which must all stay 1.
+   Also set LwIP -> Key Options -> CHECKSUM_BY_HARDWARE to Disabled in CubeMX,
+   otherwise regeneration puts this back to 1. */
+#define CHECKSUM_BY_HARDWARE 0
 /*-----------------------------------------------------------------------------*/
 
 /* LwIP Stack Parameters (modified compared to initialization value in opt.h) -*/
@@ -56,7 +63,12 @@
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
 /*----- Default Value for H7 devices: 0x30044000 -----*/
-#define LWIP_RAM_HEAP_POINTER 0x30004000
+/* Moved from 0x30004000 to 0x30008000: the zero-copy RX pool placed at
+   0x30000200 by the linker script is ~19 KB and would have overlapped a heap
+   starting at 0x30004000. Set the same value in CubeMX
+   (LwIP -> Key Options -> LWIP_RAM_HEAP_POINTER) so it survives regeneration,
+   and keep it in sync with the .lwip_sec block in STM32H750VBTX_*.ld. */
+#define LWIP_RAM_HEAP_POINTER 0x30008000
 /*----- Value supported for H7 devices: 1 -----*/
 #define LWIP_SUPPORT_CUSTOM_PBUF 1
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
@@ -82,23 +94,34 @@
 /*----- Value in opt.h for LWIP_STATS: 1 -----*/
 #define LWIP_STATS 0
 /*----- Value in opt.h for CHECKSUM_GEN_IP: 1 -----*/
-#define CHECKSUM_GEN_IP 0
+#define CHECKSUM_GEN_IP 1
 /*----- Value in opt.h for CHECKSUM_GEN_UDP: 1 -----*/
-#define CHECKSUM_GEN_UDP 0
+#define CHECKSUM_GEN_UDP 1
 /*----- Value in opt.h for CHECKSUM_GEN_TCP: 1 -----*/
-#define CHECKSUM_GEN_TCP 0
+#define CHECKSUM_GEN_TCP 1
 /*----- Value in opt.h for CHECKSUM_GEN_ICMP6: 1 -----*/
-#define CHECKSUM_GEN_ICMP6 0
+#define CHECKSUM_GEN_ICMP6 1
 /*----- Value in opt.h for CHECKSUM_CHECK_IP: 1 -----*/
-#define CHECKSUM_CHECK_IP 0
+#define CHECKSUM_CHECK_IP 1
 /*----- Value in opt.h for CHECKSUM_CHECK_UDP: 1 -----*/
-#define CHECKSUM_CHECK_UDP 0
+#define CHECKSUM_CHECK_UDP 1
 /*----- Value in opt.h for CHECKSUM_CHECK_TCP: 1 -----*/
-#define CHECKSUM_CHECK_TCP 0
+#define CHECKSUM_CHECK_TCP 1
 /*----- Value in opt.h for CHECKSUM_CHECK_ICMP6: 1 -----*/
-#define CHECKSUM_CHECK_ICMP6 0
+#define CHECKSUM_CHECK_ICMP6 1
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
+
+/* opt.h only defaults MEM_SIZE to 1600 bytes. That heap backs every
+   PBUF_RAM allocation (all transmitted packets), so keep some headroom.
+   It lives at LWIP_RAM_HEAP_POINTER in D2 SRAM, which has room to spare. */
+#define MEM_SIZE                        (16 * 1024)
+
+/* ICMP checksums: the generated block above only covers ICMP6. opt.h defaults
+   these to 1, but state them explicitly so a hardware-checksum regeneration
+   cannot silently turn ping handling into garbage. */
+#define CHECKSUM_GEN_ICMP               1
+#define CHECKSUM_CHECK_ICMP             1
 
 /* USER CODE END 1 */
 

@@ -74,6 +74,24 @@ void MX_LWIP_Init(void)
   GATEWAY_ADDRESS[3] = 0;
 
 /* USER CODE BEGIN IP_ADDRESSES */
+  /* Static addressing. DHCP is off (LWIP.LWIP_DHCP=0 in the .ioc) and the
+     generated defaults above leave the interface on 0.0.0.0, which makes every
+     outgoing packet carry source 0.0.0.0 - most hosts drop those at the socket
+     layer even though they show up in Wireshark. With a real address on the
+     same subnet as the peer, normal ARP resolves the peer and no static ARP
+     entry is needed. */
+  IP_ADDRESS[0] = 192;
+  IP_ADDRESS[1] = 168;
+  IP_ADDRESS[2] = 1;
+  IP_ADDRESS[3] = 10;
+  NETMASK_ADDRESS[0] = 255;
+  NETMASK_ADDRESS[1] = 255;
+  NETMASK_ADDRESS[2] = 255;
+  NETMASK_ADDRESS[3] = 0;
+  GATEWAY_ADDRESS[0] = 192;
+  GATEWAY_ADDRESS[1] = 168;
+  GATEWAY_ADDRESS[2] = 1;
+  GATEWAY_ADDRESS[3] = 1;
 /* USER CODE END IP_ADDRESSES */
 
   /* Initialize the LwIP stack without RTOS */

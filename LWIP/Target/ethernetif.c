@@ -2,8 +2,8 @@
 /**
   ******************************************************************************
   * File Name          : ethernetif.c
-  * Description        : This file provides code for the configuration
-  *                      of the ethernetif.c MiddleWare.
+  * Description        : Ethernet interface for a fixed MAC-to-MAC RMII link
+  *                      between the STM32H750 ETH MAC and a GSW145 switch.
   ******************************************************************************
   * @attention
   *
@@ -13,6 +13,17 @@
   * This software is licensed under terms that can be found in the LICENSE file
   * in the root directory of this software component.
   * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  *
+  * There is no PHY on this link. Port 5 of the GSW145 is wired straight to the
+  * MCU's RMII pins and the switch supplies the 50 MHz reference clock, so the
+  * LAN8742 driver CubeMX configured is not used at all: speed and duplex are
+  * forced here to match what main.c forces on the switch side.
+  *
+  * CubeMX still believes the PHY is a LAN8742. Regenerating code overwrites
+  * everything in this file outside the USER CODE markers, so re-apply it (or
+  * keep this copy) after any pin or peripheral change in the .ioc.
   *
   ******************************************************************************
   */
@@ -28,11 +39,12 @@
 #include "netif/etharp.h"
 #include "lwip/ethip6.h"
 #include "ethernetif.h"
-#include "lan8742.h"
 #include <string.h>
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
+
+#include "gsw145.h"
 
 /* USER CODE END 0 */
 
@@ -44,10 +56,22 @@
 
 /* ETH Setting  */
 #define ETH_DMA_TRANSMIT_TIMEOUT               ( 20U )
-#define ETH_TX_BUFFER_MAX             ((ETH_TX_DESC_CNT) * 2U)
 /* ETH_RX_BUFFER_SIZE parameter is defined in lwipopts.h */
 
 /* USER CODE BEGIN 1 */
+
+/* Largest frame we ever hand to the DMA: 1500 byte payload + 14 byte header,
+   rounded up to a cache line. */
+#define ETH_TX_SCRATCH_SIZE                    ( 1536U )
+
+/* Bring-up diagnostics over USART1 (main.c retargets _write). Define
+   ETHERNETIF_NO_LOG to compile these out. */
+#ifdef ETHERNETIF_NO_LOG
+#define ETHERNETIF_LOG(...)                    do { } while (0)
+#else
+#include <stdio.h>
+#define ETHERNETIF_LOG(...)                    printf(__VA_ARGS__)
+#endif
 
 /* USER CODE END 1 */
 
@@ -56,8 +80,8 @@
 @Note: This interface is implemented to operate in zero-copy mode only:
         - Rx Buffers will be allocated from LwIP stack Rx memory pool,
           then passed to ETH HAL driver.
-        - Tx Buffers will be allocated from LwIP stack memory heap,
-          then passed to ETH HAL driver.
+        - Tx Buffers are copied into a single scratch buffer, then passed to the
+          ETH HAL driver (see low_level_output).
 
 @Notes:
   1.a. ETH DMA Rx descriptors must be contiguous, the default count is 4,
@@ -98,23 +122,25 @@ static uint8_t RxAllocStatus;
 
 #pragma location=0x30000000
 ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-#pragma location=0x30000080
+#pragma location=0x30000100
 ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
 
 #elif defined ( __CC_ARM )  /* MDK ARM Compiler */
 
 __attribute__((at(0x30000000))) ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-__attribute__((at(0x30000080))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
+__attribute__((at(0x30000100))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
 
 #elif defined ( __GNUC__ ) /* GNU Compiler */
 
-ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"))); /* Ethernet Rx DMA Descriptors */
-ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));   /* Ethernet Tx DMA Descriptors */
+/* Placed in D2 SRAM by the .lwip_sec block in STM32H750VBTX_*.ld. The ETH DMA
+   cannot reach DTCM, and without that linker block these are orphan sections. */
+ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"), aligned(32))); /* Ethernet Rx DMA Descriptors */
+ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection"), aligned(32)));   /* Ethernet Tx DMA Descriptors */
 
 #endif
 
 #if defined ( __ICCARM__ ) /*!< IAR Compiler */
-#pragma location = 0x30000100
+#pragma location = 0x30000200
 extern u8_t memp_memory_RX_POOL_base[];
 
 #elif defined ( __CC_ARM ) /* MDK ARM Compiler */
@@ -126,26 +152,18 @@ __attribute__((section(".Rx_PoolSection"))) extern u8_t memp_memory_RX_POOL_base
 
 /* USER CODE BEGIN 2 */
 
+/* Single staging buffer for transmission. low_level_output() copies the pbuf
+   chain here and HAL_ETH_Transmit() blocks until the DMA is done, so one buffer
+   is enough and it can be reused on the next call. */
+static uint8_t TxScratch[ETH_TX_SCRATCH_SIZE] __ALIGNED(32);
+
 /* USER CODE END 2 */
 
 /* Global Ethernet handle */
 ETH_HandleTypeDef heth;
-ETH_TxPacketConfig TxConfig;
+ETH_TxPacketConfigTypeDef TxConfig;
 
 /* Private function prototypes -----------------------------------------------*/
-int32_t ETH_PHY_IO_Init(void);
-int32_t ETH_PHY_IO_DeInit (void);
-int32_t ETH_PHY_IO_ReadReg(uint32_t DevAddr, uint32_t RegAddr, uint32_t *pRegVal);
-int32_t ETH_PHY_IO_WriteReg(uint32_t DevAddr, uint32_t RegAddr, uint32_t RegVal);
-int32_t ETH_PHY_IO_GetTick(void);
-
-lan8742_Object_t LAN8742;
-lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
-                                  ETH_PHY_IO_DeInit,
-                                  ETH_PHY_IO_WriteReg,
-                                  ETH_PHY_IO_ReadReg,
-                                  ETH_PHY_IO_GetTick};
-
 /* USER CODE BEGIN 3 */
 
 /* USER CODE END 3 */
@@ -154,6 +172,40 @@ lan8742_IOCtx_t  LAN8742_IOCtx = {ETH_PHY_IO_Init,
 void pbuf_free_custom(struct pbuf *p);
 
 /* USER CODE BEGIN 4 */
+
+/**
+  * @brief  Enable the ETH clocks, pins and MDC divider without touching the MAC.
+  *
+  * HAL_ETH_Init() sets DMAMR.SWR and spins until the hardware clears it, which
+  * only happens once the RMII reference clock is running. On this board that
+  * clock comes from the GSW145, and the switch powers up in RGMII mode with the
+  * interface isolated (MII_CFG_5 reset value 0x2044), so it is not driving the
+  * clock yet. Programming the switch first requires MDIO, and MDIO requires the
+  * ETH clocks and the MDC divider - but not the reference clock, since MDC is
+  * derived from HCLK.
+  *
+  * So this runs first, main.c then programs the switch over MDIO, and only then
+  * does MX_LWIP_Init() reach HAL_ETH_Init() with a live reference clock.
+  *
+  * Calling HAL_ETH_MspInit() here is safe: HAL_ETH_Init() calls it again while
+  * heth.gState is still HAL_ETH_STATE_RESET, and it only re-enables clocks and
+  * re-applies the same GPIO configuration.
+  */
+void ethernetif_PreInitMDIO(void)
+{
+  heth.Instance = ETH;
+
+  /* Clocks + RMII pins, including MDC (PC1) and MDIO (PA2). */
+  HAL_ETH_MspInit(&heth);
+
+  /* Select RMII before the MAC is used, mirroring HAL_ETH_Init(). */
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  HAL_SYSCFG_ETHInterfaceSelect(SYSCFG_ETH_RMII);
+  (void)SYSCFG->PMCR;
+
+  /* MDC divider from HCLK. Independent of the RMII reference clock. */
+  HAL_ETH_SetMDIOClockRange(&heth);
+}
 
 /* USER CODE END 4 */
 
@@ -169,38 +221,101 @@ void pbuf_free_custom(struct pbuf *p);
  */
 static void low_level_init(struct netif *netif)
 {
+  ETH_MACConfigTypeDef MACConf = {0};
   HAL_StatusTypeDef hal_eth_init_status = HAL_OK;
+  uint32_t retry;
+
   /* Start ETH HAL Init */
 
-   uint8_t MACAddr[6] ;
+  /* static: heth.Init.MACAddr keeps pointing at this array after low_level_init
+     returns, so it must outlive the call. */
+  static uint8_t MACAddr[6];
   heth.Instance = ETH;
-  MACAddr[0] = 0x00;
+  /* Locally administered unicast address (bit 1 of the first octet set). */
+  MACAddr[0] = 0x02;
   MACAddr[1] = 0x80;
   MACAddr[2] = 0xE1;
   MACAddr[3] = 0x00;
   MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
+  MACAddr[5] = 0x01;
   heth.Init.MACAddr = &MACAddr[0];
   heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
   heth.Init.TxDesc = DMATxDscrTab;
   heth.Init.RxDesc = DMARxDscrTab;
-  heth.Init.RxBuffLen = 1536;
+  heth.Init.RxBuffLen = ETH_RX_BUFFER_SIZE;
 
   /* USER CODE BEGIN MACADDRESS */
 
+  /* Order matters here, and it is the whole reason this hook is used.
+     HAL_ETH_Init() below spins on the DMA software reset, which only clears
+     once the RMII reference clock is running. That clock comes from the GSW145,
+     which powers up in RGMII mode with the interface isolated. So: bring up the
+     clocks, pins and MDC divider, program the switch over MDIO, and only then
+     let HAL_ETH_Init() run.
+
+     Getting this backwards still works on the bench, because the switch keeps
+     its configuration across an MCU-only reset from the debugger - it only
+     fails on a real cold boot. */
+  ethernetif_PreInitMDIO();
+  if (GSW145_Init() != HAL_OK)
+  {
+    ETHERNETIF_LOG("[ETH] GSW145 bring-up failed\r\n");
+    /* Fall through: HAL_ETH_Init() retries below and reports if the clock never
+       appeared, which is a clearer symptom than stopping here. */
+  }
+
   /* USER CODE END MACADDRESS */
 
-  hal_eth_init_status = HAL_ETH_Init(&heth);
+  /* The DMA software reset inside HAL_ETH_Init() needs the RMII reference clock
+     the switch was just told to drive. Retry a few times so a slow clock
+     start-up does not turn into a dead interface, and complain loudly rather
+     than returning silently if it never appears. */
+  for (retry = 0U; retry < 3U; retry++)
+  {
+    hal_eth_init_status = HAL_ETH_Init(&heth);
+    if (hal_eth_init_status == HAL_OK)
+    {
+      break;
+    }
+    /* Allow a fresh attempt: HAL_ETH_Init() leaves the state at ERROR. */
+    heth.gState = HAL_ETH_STATE_RESET;
+    HAL_Delay(10);
+  }
 
-  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
+  if (hal_eth_init_status != HAL_OK)
+  {
+    /* Almost always means no 50 MHz RMII reference clock on PA1, i.e. the
+       GSW145 MII_CFG_5 write did not take effect. */
+    ETHERNETIF_LOG("[ETH] HAL_ETH_Init failed - no RMII REF_CLK from GSW145?\r\n");
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    return;
+  }
+
+  /* This link has no PHY and no auto-negotiation, so pin the MAC to the same
+     100 Mbps full duplex GSW145_Init() forced on the switch side. */
+  HAL_ETH_GetMACConfig(&heth, &MACConf);
+  MACConf.DuplexMode = ETH_FULLDUPLEX_MODE;
+  MACConf.Speed      = ETH_SPEED_100M;
+  /* The HAL default is ENABLE, which makes the MAC drop frames whose checksum
+     it dislikes before LwIP ever sees them - silently, with no error callback
+     and no counter. Checksums are verified in software instead
+     (CHECKSUM_CHECK_* in lwipopts.h). */
+  MACConf.DropTCPIPChecksumErrorPacket = DISABLE;
+  HAL_ETH_SetMACConfig(&heth, &MACConf);
+
+  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfigTypeDef));
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
+  /* Transmit side of the same decision: LwIP fills the checksums in
+     (CHECKSUM_GEN_* in lwipopts.h), the MAC must not overwrite them. */
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
   TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
 
   /* End ETH HAL Init */
 
   /* Initialize the RX POOL */
   LWIP_MEMPOOL_INIT(RX_POOL);
+  RxAllocStatus = RX_ALLOC_OK;
 
 #if LWIP_ARP || LWIP_ETHERNET
 
@@ -221,34 +336,31 @@ static void low_level_init(struct netif *netif)
   /* Accept broadcast address and ARP traffic */
   /* don't set NETIF_FLAG_ETHARP if this device is not an ethernet one */
   #if LWIP_ARP
-    netif->flags |= NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
+    netif->flags |= NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
   #else
-    netif->flags |= NETIF_FLAG_BROADCAST;
+    netif->flags |= NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHERNET;
   #endif /* LWIP_ARP */
 
 /* USER CODE BEGIN PHY_PRE_CONFIG */
 
-/* USER CODE END PHY_PRE_CONFIG */
-  /* Set PHY IO functions */
-  LAN8742_RegisterBusIO(&LAN8742, &LAN8742_IOCtx);
+  /* No PHY to probe: the link is a fixed point-to-point trace to the switch,
+     so it is up as soon as the MAC is running and stays up. */
+  netif->flags |= NETIF_FLAG_LINK_UP;
 
-  /* Initialize the LAN8742 ETH PHY */
-  if(LAN8742_Init(&LAN8742) != LAN8742_STATUS_OK)
+/* USER CODE END PHY_PRE_CONFIG */
+
+  /* Polled mode: MX_LWIP_Process() drains the DMA from the main loop via
+     ethernetif_input(). Nothing services an ETH interrupt - stm32h7xx_it.c has
+     no ETH_IRQHandler and the NVIC line is never enabled - so starting in
+     interrupt mode would only create callbacks that can never fire. */
+  if (HAL_ETH_Start(&heth) != HAL_OK)
   {
+    ETHERNETIF_LOG("[ETH] HAL_ETH_Start failed\r\n");
     netif_set_link_down(netif);
     netif_set_down(netif);
     return;
   }
 
-  if (hal_eth_init_status == HAL_OK)
-  {
-  /* Get link state */
-  ethernet_link_check_state(netif);
-  }
-  else
-  {
-    Error_Handler();
-  }
 #endif /* LWIP_ARP || LWIP_ETHERNET */
 
 /* USER CODE BEGIN LOW_LEVEL_INIT */
@@ -265,50 +377,47 @@ static void low_level_init(struct netif *netif)
  * @param p the MAC packet to send (e.g. IP packet including MAC addresses and type)
  * @return ERR_OK if the packet could be sent
  *         an err_t value if the packet couldn't be sent
- *
- * @note Returning ERR_MEM here if a DMA queue of your MAC is full can lead to
- *       strange results. You might consider waiting for space in the DMA queue
- *       to become available since the stack doesn't retry to send a packet
- *       dropped because of memory failure (except for the TCP timers).
  */
 
 static err_t low_level_output(struct netif *netif, struct pbuf *p)
 {
-  uint32_t i = 0U;
-  struct pbuf *q = NULL;
-  err_t errval = ERR_OK;
-  ETH_BufferTypeDef Txbuffer[ETH_TX_DESC_CNT] = {0};
+  ETH_BufferTypeDef Txbuffer = {0};
+  uint16_t framelen = p->tot_len;
 
-  memset(Txbuffer, 0 , ETH_TX_DESC_CNT*sizeof(ETH_BufferTypeDef));
+  LWIP_UNUSED_ARG(netif);
 
-  for(q = p; q != NULL; q = q->next)
+  if ((framelen == 0U) || (framelen > ETH_TX_SCRATCH_SIZE))
   {
-    if(i >= ETH_TX_DESC_CNT)
-      return ERR_IF;
-
-    Txbuffer[i].buffer = q->payload;
-    Txbuffer[i].len = q->len;
-
-    if(i>0)
-    {
-      Txbuffer[i-1].next = &Txbuffer[i];
-    }
-
-    if(q->next == NULL)
-    {
-      Txbuffer[i].next = NULL;
-    }
-
-    i++;
+    return ERR_BUF;
   }
 
-  TxConfig.Length = p->tot_len;
-  TxConfig.TxBuffer = Txbuffer;
-  TxConfig.pData = p;
+  /* Flatten the chain into one buffer. Slower than handing the DMA the pbuf
+     segments directly, but it keeps the descriptor handling trivial and the
+     buffer alignment under our control. */
+  if (pbuf_copy_partial(p, TxScratch, framelen, 0U) != framelen)
+  {
+    return ERR_BUF;
+  }
 
-  HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT);
+  Txbuffer.buffer = TxScratch;
+  Txbuffer.len    = framelen;
+  Txbuffer.next   = NULL;
 
-  return errval;
+  TxConfig.Length   = framelen;
+  TxConfig.TxBuffer = &Txbuffer;
+  /* The payload was copied out, so there is no pbuf for the HAL to release and
+     HAL_ETH_TxFreeCallback() has nothing to free. */
+  TxConfig.pData    = NULL;
+
+  /* Reclaim descriptors from previous transmissions. */
+  (void)HAL_ETH_ReleaseTxPacket(&heth);
+
+  if (HAL_ETH_Transmit(&heth, &TxConfig, ETH_DMA_TRANSMIT_TIMEOUT) != HAL_OK)
+  {
+    return ERR_IF;
+  }
+
+  return ERR_OK;
 }
 
 /**
@@ -323,9 +432,14 @@ static struct pbuf * low_level_input(struct netif *netif)
 {
   struct pbuf *p = NULL;
 
+  LWIP_UNUSED_ARG(netif);
+
   if(RxAllocStatus == RX_ALLOC_OK)
   {
-    HAL_ETH_ReadData(&heth, (void **)&p);
+    if (HAL_ETH_ReadData(&heth, (void **)&p) != HAL_OK)
+    {
+      p = NULL;
+    }
   }
 
   return p;
@@ -355,6 +469,19 @@ void ethernetif_input(struct netif *netif)
       }
     }
   } while(p!=NULL);
+
+/* USER CODE BEGIN ETHERNETIF_INPUT */
+
+  /* Clear the latched "receive buffer unavailable" status. Reception itself
+     restarts on its own: HAL_ETH_ReadData() calls ETH_UpdateDescriptor(), which
+     rewrites DMACRDTPR once pbufs are handed back. Leaving the sticky bit set
+     just makes the DMA status register confusing under a debugger. */
+  if ((heth.Instance->DMACSR & ETH_DMACSR_RBU) != 0U)
+  {
+    heth.Instance->DMACSR = ETH_DMACSR_RBU;
+  }
+
+/* USER CODE END ETHERNETIF_INPUT */
 }
 
 #if !LWIP_ARP
@@ -398,13 +525,6 @@ err_t ethernetif_init(struct netif *netif)
   /* Initialize interface hostname */
   netif->hostname = "lwip";
 #endif /* LWIP_NETIF_HOSTNAME */
-
-  /*
-   * Initialize the snmp variables and counters inside the struct netif.
-   * The last argument should be replaced with your link speed, in units
-   * of bits per second.
-   */
-  // MIB2_INIT_NETIF(netif, snmp_ifType_ethernet_csmacd, LINK_SPEED_OF_YOUR_NETIF_IN_BPS);
 
   netif->name[0] = IFNAME0;
   netif->name[1] = IFNAME1;
@@ -565,138 +685,31 @@ void HAL_ETH_MspDeInit(ETH_HandleTypeDef* ethHandle)
   }
 }
 
-/*******************************************************************************
-                       PHI IO Functions
-*******************************************************************************/
-/**
-  * @brief  Initializes the MDIO interface GPIO and clocks.
-  * @param  None
-  * @retval 0 if OK, -1 if ERROR
-  */
-int32_t ETH_PHY_IO_Init(void)
-{
-  /* We assume that MDIO GPIO configuration is already done
-     in the ETH_MspInit() else it should be done here
-  */
-
-  /* Configure the MDIO Clock */
-  HAL_ETH_SetMDIOClockRange(&heth);
-
-  return 0;
-}
-
-/**
-  * @brief  De-Initializes the MDIO interface .
-  * @param  None
-  * @retval 0 if OK, -1 if ERROR
-  */
-int32_t ETH_PHY_IO_DeInit (void)
-{
-  return 0;
-}
-
-/**
-  * @brief  Read a PHY register through the MDIO interface.
-  * @param  DevAddr: PHY port address
-  * @param  RegAddr: PHY register address
-  * @param  pRegVal: pointer to hold the register value
-  * @retval 0 if OK -1 if Error
-  */
-int32_t ETH_PHY_IO_ReadReg(uint32_t DevAddr, uint32_t RegAddr, uint32_t *pRegVal)
-{
-  if(HAL_ETH_ReadPHYRegister(&heth, DevAddr, RegAddr, pRegVal) != HAL_OK)
-  {
-    return -1;
-  }
-
-  return 0;
-}
-
-/**
-  * @brief  Write a value to a PHY register through the MDIO interface.
-  * @param  DevAddr: PHY port address
-  * @param  RegAddr: PHY register address
-  * @param  RegVal: Value to be written
-  * @retval 0 if OK -1 if Error
-  */
-int32_t ETH_PHY_IO_WriteReg(uint32_t DevAddr, uint32_t RegAddr, uint32_t RegVal)
-{
-  if(HAL_ETH_WritePHYRegister(&heth, DevAddr, RegAddr, RegVal) != HAL_OK)
-  {
-    return -1;
-  }
-
-  return 0;
-}
-
-/**
-  * @brief  Get the time in millisecons used for internal PHY driver process.
-  * @retval Time value
-  */
-int32_t ETH_PHY_IO_GetTick(void)
-{
-  return HAL_GetTick();
-}
-
 /**
   * @brief  Check the ETH link state then update ETH driver and netif link accordingly.
   * @retval None
   */
 void ethernet_link_check_state(struct netif *netif)
 {
-  ETH_MACConfigTypeDef MACConf = {0};
-  int32_t PHYLinkState = 0;
-  uint32_t linkchanged = 0U, speed = 0U, duplex = 0U;
+/* USER CODE BEGIN ETHERNET_LINK_CHECK_STATE */
 
-  PHYLinkState = LAN8742_GetLinkState(&LAN8742);
+  /* Deliberately empty.
+   *
+   * MX_LWIP_Process() calls this every 100 ms. The stock body polls the LAN8742
+   * over MDIO, but there is no PHY on this link - port 5 of the GSW145 is wired
+   * directly to the RMII pins - so any read would return 0xFFFF, be read as
+   * "link down", and tear the interface down every 100 ms.
+   *
+   * The link is a fixed trace that is up whenever both ends are powered, so
+   * NETIF_FLAG_LINK_UP is set once in low_level_init() and left alone.
+   *
+   * The trade-off is real: a broken trace, a switch reset or a GSW145
+   * reconfiguration is now invisible to the stack. If that matters, poll
+   * PHY_ADDR_5 / the port-5 link status over MDIO here instead of returning.
+   */
+  LWIP_UNUSED_ARG(netif);
 
-  if(netif_is_link_up(netif) && (PHYLinkState <= LAN8742_STATUS_LINK_DOWN))
-  {
-    HAL_ETH_Stop(&heth);
-    netif_set_down(netif);
-    netif_set_link_down(netif);
-  }
-  else if(!netif_is_link_up(netif) && (PHYLinkState > LAN8742_STATUS_LINK_DOWN))
-  {
-    switch (PHYLinkState)
-    {
-    case LAN8742_STATUS_100MBITS_FULLDUPLEX:
-      duplex = ETH_FULLDUPLEX_MODE;
-      speed = ETH_SPEED_100M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_100MBITS_HALFDUPLEX:
-      duplex = ETH_HALFDUPLEX_MODE;
-      speed = ETH_SPEED_100M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_10MBITS_FULLDUPLEX:
-      duplex = ETH_FULLDUPLEX_MODE;
-      speed = ETH_SPEED_10M;
-      linkchanged = 1;
-      break;
-    case LAN8742_STATUS_10MBITS_HALFDUPLEX:
-      duplex = ETH_HALFDUPLEX_MODE;
-      speed = ETH_SPEED_10M;
-      linkchanged = 1;
-      break;
-    default:
-      break;
-    }
-
-    if(linkchanged)
-    {
-      /* Get MAC Config MAC */
-      HAL_ETH_GetMACConfig(&heth, &MACConf);
-      MACConf.DuplexMode = duplex;
-      MACConf.Speed = speed;
-      HAL_ETH_SetMACConfig(&heth, &MACConf);
-      HAL_ETH_Start(&heth);
-      netif_set_up(netif);
-      netif_set_link_up(netif);
-    }
-  }
-
+/* USER CODE END ETHERNET_LINK_CHECK_STATE */
 }
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
@@ -755,8 +768,11 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
     p->tot_len += Length;
   }
 
-  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
-  SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
+  /* No cache maintenance here: the D-Cache is never enabled on this project
+     (nothing calls SCB_EnableDCache), so the DMA and the core see the same
+     memory. If you ever enable the D-Cache, invalidate this buffer here AND
+     handle DMARxDscrTab / DMATxDscrTab, which are not covered by any
+     invalidate in this file. */
 
 /* USER CODE END HAL ETH RxLinkCallback */
 }
@@ -765,7 +781,12 @@ void HAL_ETH_TxFreeCallback(uint32_t * buff)
 {
 /* USER CODE BEGIN HAL ETH TxFreeCallback */
 
-  pbuf_free((struct pbuf *)buff);
+  /* low_level_output() copies into TxScratch and leaves TxConfig.pData NULL,
+     so there is normally nothing to free. Guard anyway. */
+  if (buff != NULL)
+  {
+    pbuf_free((struct pbuf *)buff);
+  }
 
 /* USER CODE END HAL ETH TxFreeCallback */
 }
@@ -773,4 +794,3 @@ void HAL_ETH_TxFreeCallback(uint32_t * buff)
 /* USER CODE BEGIN 8 */
 
 /* USER CODE END 8 */
-
