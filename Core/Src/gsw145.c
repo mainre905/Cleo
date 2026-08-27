@@ -223,3 +223,55 @@ HAL_StatusTypeDef GSW145_Init(void)
   GSW145_LOG("[GSW145] port 5 forced 100M/FDX, RMII clock out\r\n");
   return HAL_OK;
 }
+
+
+/**
+  * @brief  GSW145 하드웨어 1Gbps 패킷 제너레이터 활성화
+  */
+HAL_StatusTypeDef GSW145_Start1G_TrafficGenerator(uint8_t port_num)
+{
+  HAL_StatusTypeDef status = HAL_OK;
+  uint16_t phy_addr = port_num; // GSW145 내장 GPHY 주소 (0~4)
+
+  printf("[GSW145] Starting 1Gbps Packet Generator on Port %d...\r\n", port_num);
+
+  /* 1. 해당 포트의 PHY를 1000Mbps Full-Duplex로 강제 설정 (Auto-Negotiation 후 1G 고정) */
+  // MII_BMCR (PHY Offset 0x0000) -> 1000Mbps(Bit6=1, Bit13=0), Full-Duplex(Bit8=1)
+  uint16_t bmcr_val = 0;
+  status |= GSW145_ReadReg((phy_addr << 5) | 0x0000, &bmcr_val);
+  bmcr_val |= (1 << 6) | (1 << 8); // 1000M Speed + Full Duplex
+  bmcr_val &= ~(1 << 13);
+  status |= GSW145_WriteReg((phy_addr << 5) | 0x0000, bmcr_val);
+
+  /* 2. GSW145 스위치 코어 MAC BIST / Traffic Generator 레지스터 설정 */
+  // (GSW145 데이터시트 Section 3.2 MAC BIST Control 기준)
+
+  // 2-1. Destination MAC 주소 설정 (Broadcast: FF:FF:FF:FF:FF:FF 또는 PC MAC)
+  status |= GSW145_WriteReg(0xF200 + (port_num * 0x10), 0xFFFF); // DA Low
+  status |= GSW145_WriteReg(0xF201 + (port_num * 0x10), 0xFFFF); // DA Mid
+  status |= GSW145_WriteReg(0xF202 + (port_num * 0x10), 0xFFFF); // DA High
+
+  // 2-2. Source MAC 주소 설정 (GSW145 포트 MAC: 02:00:00:00:00:01)
+  status |= GSW145_WriteReg(0xF203 + (port_num * 0x10), 0x0001); // SA Low
+  status |= GSW145_WriteReg(0xF204 + (port_num * 0x10), 0x0000); // SA Mid
+  status |= GSW145_WriteReg(0xF205 + (port_num * 0x10), 0x0200); // SA High
+
+  // 2-3. 패킷 길이 설정 (1518 bytes - 최대 와이어 스피드 효율을 내기 위함)
+  status |= GSW145_WriteReg(0xF206 + (port_num * 0x10), 1518);
+
+  // 2-4. BIST 제어 레지스터 설정: 연속 송신(Continuous), MAC Frame 생성 활성화
+  // Bit 0: Enable, Bit 1: Continuous Mode, Bit 2: Random Payload
+  uint16_t bist_ctrl = (1 << 0) | (1 << 1) | (1 << 2);
+  status |= GSW145_WriteReg(0xF207 + (port_num * 0x10), bist_ctrl);
+
+  if (status == HAL_OK)
+  {
+    printf("[GSW145] Traffic Generator Started! Outputting ~1Gbps continuous frames.\r\n");
+  }
+  else
+  {
+    printf("[GSW145] Failed to start Traffic Generator.\r\n");
+  }
+
+  return status;
+}

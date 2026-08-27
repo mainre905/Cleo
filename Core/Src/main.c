@@ -134,15 +134,27 @@ static void UDP_Test_Send(void)
   struct pbuf *p;
   err_t err;
 
-  if ((g_udp_pcb == NULL) || !netif_is_link_up(&gnetif) || !netif_is_up(&gnetif))
+  /* 어디서 튕겨 나가는지 디버그 출력 추가 */
+  if (g_udp_pcb == NULL)
   {
+    printf("[UDP] Fail: g_udp_pcb is NULL\r\n");
+    return;
+  }
+  if (!netif_is_link_up(&gnetif))
+  {
+    printf("[UDP] Fail: Link is DOWN\r\n");
+    return;
+  }
+  if (!netif_is_up(&gnetif))
+  {
+    printf("[UDP] Fail: Netif is NOT UP\r\n");
     return;
   }
 
   p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(sizeof(msg) - 1U), PBUF_RAM);
   if (p == NULL)
   {
-    printf("[UDP] pbuf_alloc failed\r\n");
+    printf("[UDP] Fail: pbuf_alloc failed\r\n");
     return;
   }
 
@@ -150,12 +162,13 @@ static void UDP_Test_Send(void)
   err = udp_send(g_udp_pcb, p);
   pbuf_free(p);
 
-  /* Report the result rather than assuming it. udp_send() returning ERR_OK
-     means the frame reached the MAC, not that the peer received it - confirm
-     that on the peer (Wireshark or a listening socket). */
-  if (err != ERR_OK)
+  if (err == ERR_OK)
   {
-    printf("[UDP] send failed, err=%d\r\n", (int)err);
+    printf("[UDP] Send Success!\r\n"); /* 성공 시 PuTTY에 출력 */
+  }
+  else
+  {
+    printf("[UDP] Send failed, err=%d\r\n", (int)err);
   }
 }
 
@@ -204,6 +217,8 @@ int main(void)
   printf("[NET] ip=%s link=%s\r\n",
          ip4addr_ntoa(netif_ip4_addr(&gnetif)),
          netif_is_link_up(&gnetif) ? "up" : "DOWN");
+
+  GSW145_Start1G_TrafficGenerator(0);
 
   UDP_Test_Init();
 
