@@ -224,54 +224,318 @@ HAL_StatusTypeDef GSW145_Init(void)
   return HAL_OK;
 }
 
+/* ========================================================================== */
+/* Internal GPHY access over the switch's MDIO master interface               */
+/* ========================================================================== */
+
+/* MDIO master proxy (p.160-161). A PHY register is not part of the switch's
+   own address space; the switch issues an MDIO frame on its master bus on our
+   behalf. */
+#define GSW145_REG_MMDIO_CTRL     0xF408U
+#define GSW145_REG_MMDIO_READ     0xF409U
+#define GSW145_REG_MMDIO_WRITE    0xF40AU
+#define GSW145_MMDIO_MBUSY        (1U << 12)
+#define GSW145_MMDIO_OP_WR        (1U << 10)   /* OP[11:10] = 01 */
+#define GSW145_MMDIO_OP_RD        (2U << 10)   /* OP[11:10] = 10 */
+
+/* PHY_ADDR_0 is the highest offset and the ports count downwards, so port N
+   lives at PHY_ADDR_0 - N (p.135: F415 = port 0 ... F412 = port 3). */
+#define GSW145_REG_PHY_ADDR_0     0xF415U
+#define GSW145_PHY_ADDR_ADDR_MASK 0x001FU
+
+/* PHY MDIO register offsets (p.280). */
+#define GSW145_PHY_REG_MIISTAT    0x18U        /* negotiated speed/duplex   */
+#define GSW145_PHY_REG_TPGCTRL    0x1CU        /* test-packet generator     */
+
+/* MIISTAT fields (p.307). */
+#define GSW145_MIISTAT_DPX        (1U << 3)
+#define GSW145_MIISTAT_SPEED_MASK 0x0003U
+#define GSW145_MIISTAT_SPEED_10   0x0000U
+#define GSW145_MIISTAT_SPEED_100  0x0001U
+#define GSW145_MIISTAT_SPEED_1000 0x0002U
+
+/* TPGCTRL, offset 0x1C (p.313-315).
+ *
+ *  0x0450 = 0000 0100 0101 0000
+ *    CHSEL    [15:14] = 00    channel A, unused outside debug dumping
+ *    MODE     [13]    = 0     CONTINUOUS - keep sending until stopped
+ *    BURST4EN [12]    = 0     no 4-packet debug bursts
+ *    IPGL     [11:10] = 01    96 bit-time inter-packet gap, the IEEE minimum.
+ *                             00 would be 48 BT, below spec, and a receiver is
+ *                             entitled to drop the frames.
+ *    TYPE     [9:8]   = 00    RANDOM payload
+ *    SIZE     [6:4]   = 101   1518-byte frames, the largest non-jumbo size, so
+ *                             the per-frame overhead is as small as it gets
+ *    MOPT     [3:2]   = 00
+ *    START    [1]     = 0     set separately, after EN
+ *    EN       [0]     = 0     set first
+ *
+ *  1518 bytes of frame + 8 preamble/SFD + 12 gap = 1538 on the wire, so a
+ *  1000BASE-T link carries 1518/1538 = 98.7% of 1 Gbit/s, about 987 Mbit/s.
+ */
+#define GSW145_TPGCTRL_BASE       0x0450U
+#define GSW145_TPGCTRL_EN         (1U << 0)
+#define GSW145_TPGCTRL_START      (1U << 1)
+
+/* MMDC_CFG_0 polling-enable bit for an arbitrary port. */
+#define GSW145_MMDC_CFG0_PORT(p)  ((uint16_t)(1U << (p)))
 
 /**
-  * @brief  GSW145 하드웨어 1Gbps 패킷 제너레이터 활성화
+  * @brief  Wait for the MDIO master to finish whatever it is doing.
+  *
+  * The auto-polling state machine shares this bus, so a transaction can already
+  * be in flight when we arrive.
   */
-HAL_StatusTypeDef GSW145_Start1G_TrafficGenerator(uint8_t port_num)
+static HAL_StatusTypeDef GSW145_MmdioWaitIdle(void)
 {
-  HAL_StatusTypeDef status = HAL_OK;
-  uint16_t phy_addr = port_num; // GSW145 내장 GPHY 주소 (0~4)
+  uint32_t start = HAL_GetTick();
+  uint16_t ctrl = 0U;
 
-  printf("[GSW145] Starting 1Gbps Packet Generator on Port %d...\r\n", port_num);
-
-  /* 1. 해당 포트의 PHY를 1000Mbps Full-Duplex로 강제 설정 (Auto-Negotiation 후 1G 고정) */
-  // MII_BMCR (PHY Offset 0x0000) -> 1000Mbps(Bit6=1, Bit13=0), Full-Duplex(Bit8=1)
-  uint16_t bmcr_val = 0;
-  status |= GSW145_ReadReg((phy_addr << 5) | 0x0000, &bmcr_val);
-  bmcr_val |= (1 << 6) | (1 << 8); // 1000M Speed + Full Duplex
-  bmcr_val &= ~(1 << 13);
-  status |= GSW145_WriteReg((phy_addr << 5) | 0x0000, bmcr_val);
-
-  /* 2. GSW145 스위치 코어 MAC BIST / Traffic Generator 레지스터 설정 */
-  // (GSW145 데이터시트 Section 3.2 MAC BIST Control 기준)
-
-  // 2-1. Destination MAC 주소 설정 (Broadcast: FF:FF:FF:FF:FF:FF 또는 PC MAC)
-  status |= GSW145_WriteReg(0xF200 + (port_num * 0x10), 0xFFFF); // DA Low
-  status |= GSW145_WriteReg(0xF201 + (port_num * 0x10), 0xFFFF); // DA Mid
-  status |= GSW145_WriteReg(0xF202 + (port_num * 0x10), 0xFFFF); // DA High
-
-  // 2-2. Source MAC 주소 설정 (GSW145 포트 MAC: 02:00:00:00:00:01)
-  status |= GSW145_WriteReg(0xF203 + (port_num * 0x10), 0x0001); // SA Low
-  status |= GSW145_WriteReg(0xF204 + (port_num * 0x10), 0x0000); // SA Mid
-  status |= GSW145_WriteReg(0xF205 + (port_num * 0x10), 0x0200); // SA High
-
-  // 2-3. 패킷 길이 설정 (1518 bytes - 최대 와이어 스피드 효율을 내기 위함)
-  status |= GSW145_WriteReg(0xF206 + (port_num * 0x10), 1518);
-
-  // 2-4. BIST 제어 레지스터 설정: 연속 송신(Continuous), MAC Frame 생성 활성화
-  // Bit 0: Enable, Bit 1: Continuous Mode, Bit 2: Random Payload
-  uint16_t bist_ctrl = (1 << 0) | (1 << 1) | (1 << 2);
-  status |= GSW145_WriteReg(0xF207 + (port_num * 0x10), bist_ctrl);
-
-  if (status == HAL_OK)
+  for (;;)
   {
-    printf("[GSW145] Traffic Generator Started! Outputting ~1Gbps continuous frames.\r\n");
+    if (GSW145_ReadReg(GSW145_REG_MMDIO_CTRL, &ctrl) != HAL_OK)
+    {
+      return HAL_ERROR;
+    }
+    if ((ctrl & GSW145_MMDIO_MBUSY) == 0U)
+    {
+      return HAL_OK;
+    }
+    if ((HAL_GetTick() - start) > 20U)
+    {
+      GSW145_LOG("[GSW145] MDIO master stuck busy\r\n");
+      return HAL_TIMEOUT;
+    }
+  }
+}
+
+HAL_StatusTypeDef GSW145_PhyWrite(uint8_t phy_addr, uint8_t reg, uint16_t val)
+{
+  uint16_t ctrl;
+
+  if (GSW145_MmdioWaitIdle() != HAL_OK)
+  {
+    return HAL_TIMEOUT;
+  }
+
+  /* The data register must be loaded before the command that consumes it. */
+  if (GSW145_WriteReg(GSW145_REG_MMDIO_WRITE, val) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  ctrl = (uint16_t)(GSW145_MMDIO_OP_WR
+                    | ((uint16_t)(phy_addr & 0x1FU) << 5)
+                    | (uint16_t)(reg & 0x1FU));
+  if (GSW145_WriteReg(GSW145_REG_MMDIO_CTRL, ctrl) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  return GSW145_MmdioWaitIdle();
+}
+
+HAL_StatusTypeDef GSW145_PhyRead(uint8_t phy_addr, uint8_t reg, uint16_t *val)
+{
+  uint16_t ctrl;
+
+  if (val == NULL)
+  {
+    return HAL_ERROR;
+  }
+  if (GSW145_MmdioWaitIdle() != HAL_OK)
+  {
+    return HAL_TIMEOUT;
+  }
+
+  ctrl = (uint16_t)(GSW145_MMDIO_OP_RD
+                    | ((uint16_t)(phy_addr & 0x1FU) << 5)
+                    | (uint16_t)(reg & 0x1FU));
+  if (GSW145_WriteReg(GSW145_REG_MMDIO_CTRL, ctrl) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  /* Data is only valid once the switch has clocked the frame out and back. */
+  if (GSW145_MmdioWaitIdle() != HAL_OK)
+  {
+    return HAL_TIMEOUT;
+  }
+
+  return GSW145_ReadReg(GSW145_REG_MMDIO_READ, val);
+}
+
+HAL_StatusTypeDef GSW145_GetPortPhyAddr(uint8_t port, uint8_t *phy_addr)
+{
+  uint16_t reg = 0U;
+
+  if ((port >= GSW145_GPHY_PORT_COUNT) || (phy_addr == NULL))
+  {
+    return HAL_ERROR;
+  }
+  if (GSW145_ReadReg((uint16_t)(GSW145_REG_PHY_ADDR_0 - port), &reg) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  *phy_addr = (uint8_t)(reg & GSW145_PHY_ADDR_ADDR_MASK);
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef GSW145_GetPortLink(uint8_t port, uint16_t *speed_mbps,
+                                     uint8_t *full_duplex)
+{
+  uint8_t phy_addr = 0U;
+  uint16_t miistat = 0U;
+
+  if ((speed_mbps == NULL) || (full_duplex == NULL))
+  {
+    return HAL_ERROR;
+  }
+  if (GSW145_GetPortPhyAddr(port, &phy_addr) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  if (GSW145_PhyRead(phy_addr, GSW145_PHY_REG_MIISTAT, &miistat) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  switch (miistat & GSW145_MIISTAT_SPEED_MASK)
+  {
+    case GSW145_MIISTAT_SPEED_10:   *speed_mbps = 10U;   break;
+    case GSW145_MIISTAT_SPEED_100:  *speed_mbps = 100U;  break;
+    case GSW145_MIISTAT_SPEED_1000: *speed_mbps = 1000U; break;
+    default:                        *speed_mbps = 0U;    break;  /* FRE mode */
+  }
+  *full_duplex = ((miistat & GSW145_MIISTAT_DPX) != 0U) ? 1U : 0U;
+
+  return HAL_OK;
+}
+
+/**
+  * @brief  Suspend or resume the auto-polling state machine for one port.
+  *
+  * The polling FSM drives the same MDIO master bus we are about to use, and
+  * p.37 warns that polling clears latching status bits underneath software.
+  * Parking it for the port under test keeps the TPG writes deterministic.
+  */
+static HAL_StatusTypeDef GSW145_SetPortPolling(uint8_t port, uint8_t enable)
+{
+  uint16_t cfg = 0U;
+
+  if (GSW145_ReadReg(GSW145_REG_MMDC_CFG_0, &cfg) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  if (enable != 0U)
+  {
+    cfg |= GSW145_MMDC_CFG0_PORT(port);
   }
   else
   {
-    printf("[GSW145] Failed to start Traffic Generator.\r\n");
+    cfg &= (uint16_t)~GSW145_MMDC_CFG0_PORT(port);
+  }
+  return GSW145_WriteReg(GSW145_REG_MMDC_CFG_0, cfg);
+}
+
+HAL_StatusTypeDef GSW145_TpgStart(uint8_t port)
+{
+  uint8_t phy_addr = 0U;
+  uint8_t full_duplex = 0U;
+  uint16_t speed = 0U;
+  uint16_t readback = 0U;
+
+  if (port >= GSW145_GPHY_PORT_COUNT)
+  {
+    GSW145_LOG("[TPG] port %u has no internal PHY (use 0-3)\r\n",
+               (unsigned)port);
+    return HAL_ERROR;
   }
 
+  if (GSW145_GetPortPhyAddr(port, &phy_addr) != HAL_OK)
+  {
+    GSW145_LOG("[TPG] cannot read PHY address for port %u\r\n", (unsigned)port);
+    return HAL_ERROR;
+  }
+
+  /* Refuse to "measure 1 Gbit/s" on a link that is not running at 1 Gbit/s. */
+  if (GSW145_GetPortLink(port, &speed, &full_duplex) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  if (speed == 0U)
+  {
+    GSW145_LOG("[TPG] port %u has no link - plug the cable into the PC\r\n",
+               (unsigned)port);
+    return HAL_ERROR;
+  }
+  if (speed != 1000U)
+  {
+    GSW145_LOG("[TPG] port %u linked at %u Mbps %s, not 1000BASE-T\r\n",
+               (unsigned)port, (unsigned)speed, full_duplex ? "FDX" : "HDX");
+    GSW145_LOG("[TPG] check the cable (needs all 4 pairs) and the PC NIC\r\n");
+    return HAL_ERROR;
+  }
+
+  GSW145_LOG("[TPG] port %u (PHY %u) linked 1000BASE-T %s\r\n",
+             (unsigned)port, (unsigned)phy_addr, full_duplex ? "FDX" : "HDX");
+
+  (void)GSW145_SetPortPolling(port, 0U);
+
+  /* Enable first, then start - the two bits are documented separately. */
+  if (GSW145_PhyWrite(phy_addr, GSW145_PHY_REG_TPGCTRL,
+                      GSW145_TPGCTRL_BASE | GSW145_TPGCTRL_EN) != HAL_OK)
+  {
+    GSW145_LOG("[TPG] enable failed\r\n");
+    (void)GSW145_SetPortPolling(port, 1U);
+    return HAL_ERROR;
+  }
+  if (GSW145_PhyWrite(phy_addr, GSW145_PHY_REG_TPGCTRL,
+                      GSW145_TPGCTRL_BASE | GSW145_TPGCTRL_EN
+                      | GSW145_TPGCTRL_START) != HAL_OK)
+  {
+    GSW145_LOG("[TPG] start failed\r\n");
+    (void)GSW145_SetPortPolling(port, 1U);
+    return HAL_ERROR;
+  }
+
+  if (GSW145_PhyRead(phy_addr, GSW145_PHY_REG_TPGCTRL, &readback) == HAL_OK)
+  {
+    GSW145_LOG("[TPG] TPGCTRL = 0x%04X\r\n", readback);
+  }
+
+  GSW145_LOG("[TPG] running: 1518-byte frames, ~987 Mbps of payload\r\n");
+  GSW145_LOG("[TPG] frames go to 00-03-19-FF-FF-Fx, so capture the PC NIC in\r\n");
+  GSW145_LOG("[TPG] promiscuous mode (Wireshark) or the NIC will discard them\r\n");
+  return HAL_OK;
+}
+
+HAL_StatusTypeDef GSW145_TpgStop(uint8_t port)
+{
+  uint8_t phy_addr = 0U;
+  HAL_StatusTypeDef status;
+
+  if (port >= GSW145_GPHY_PORT_COUNT)
+  {
+    return HAL_ERROR;
+  }
+  if (GSW145_GetPortPhyAddr(port, &phy_addr) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  /* Drop START before EN, mirroring the start order. */
+  status = GSW145_PhyWrite(phy_addr, GSW145_PHY_REG_TPGCTRL,
+                           GSW145_TPGCTRL_BASE | GSW145_TPGCTRL_EN);
+  if (status == HAL_OK)
+  {
+    status = GSW145_PhyWrite(phy_addr, GSW145_PHY_REG_TPGCTRL,
+                             GSW145_TPGCTRL_BASE);
+  }
+
+  (void)GSW145_SetPortPolling(port, 1U);
+
+  GSW145_LOG("[TPG] port %u stopped\r\n", (unsigned)port);
   return status;
 }

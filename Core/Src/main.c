@@ -25,6 +25,7 @@
 #include "lwip/netif.h"
 #include "lwip/udp.h"
 #include "lwip/ip_addr.h"
+#include "gsw145.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -70,6 +71,11 @@ extern struct netif gnetif;   /* defined in LWIP/App/lwip.c */
 
 static struct udp_pcb *g_udp_pcb;
 static ip_addr_t       g_peer_ip;
+
+/* Console state: which RJ45 port the TPG commands act on, and whether it is
+   currently running so 'g' and 's' cannot get out of step. */
+static uint8_t g_tpg_port    = 0U;
+static uint8_t g_tpg_running = 0U;
 
 /* USER CODE END PV */
 
@@ -172,6 +178,121 @@ static void UDP_Test_Send(void)
   }
 }
 
+/**
+  * @brief  Print the console's command list.
+  */
+static void Console_Help(void)
+{
+  printf("\r\n--- commands ---\r\n");
+  printf("  0-3  select RJ45 port (now: %u)\r\n", (unsigned)g_tpg_port);
+  printf("  g    start 1G traffic generator on the selected port\r\n");
+  printf("  s    stop it\r\n");
+  printf("  l    link status of all RJ45 ports\r\n");
+  printf("  h    this list\r\n\r\n");
+}
+
+/**
+  * @brief  Report the negotiated link on every internal GPHY port.
+  */
+static void Console_ShowLinks(void)
+{
+  uint16_t speed;
+  uint8_t fdx;
+  uint8_t port;
+
+  printf("\r\n--- RJ45 link status ---\r\n");
+  for (port = 0U; port < GSW145_GPHY_PORT_COUNT; port++)
+  {
+    if (GSW145_GetPortLink(port, &speed, &fdx) != HAL_OK)
+    {
+      printf("  port %u : read failed\r\n", (unsigned)port);
+    }
+    else if (speed == 0U)
+    {
+      printf("  port %u : no link\r\n", (unsigned)port);
+    }
+    else
+    {
+      printf("  port %u : %u Mbps %s\r\n", (unsigned)port, (unsigned)speed,
+             fdx ? "full duplex" : "HALF duplex");
+    }
+  }
+  printf("\r\n");
+}
+
+/**
+  * @brief  Pull one character from USART1 without blocking.
+  * @retval The character, or -1 when nothing has arrived.
+  */
+static int Console_ReadChar(void)
+{
+  /* An overrun latches ORE and stops further reception until cleared, which
+     is easy to hit while the TPG log is being printed. */
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET)
+  {
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+  }
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE) == RESET)
+  {
+    return -1;
+  }
+  return (int)(uint8_t)(huart1.Instance->RDR & 0xFFU);
+}
+
+/**
+  * @brief  Handle one console keystroke, if any is waiting.
+  */
+static void Console_Poll(void)
+{
+  int c = Console_ReadChar();
+
+  if (c < 0)
+  {
+    return;
+  }
+
+  switch (c)
+  {
+    case '0': case '1': case '2': case '3':
+      g_tpg_port = (uint8_t)(c - '0');
+      printf("[cmd] port %u selected\r\n", (unsigned)g_tpg_port);
+      break;
+
+    case 'g': case 'G':
+      if (g_tpg_running != 0U)
+      {
+        printf("[cmd] already running on port %u\r\n", (unsigned)g_tpg_port);
+        break;
+      }
+      if (GSW145_TpgStart(g_tpg_port) == HAL_OK)
+      {
+        g_tpg_running = 1U;
+      }
+      break;
+
+    case 's': case 'S':
+      if (g_tpg_running == 0U)
+      {
+        printf("[cmd] not running\r\n");
+        break;
+      }
+      (void)GSW145_TpgStop(g_tpg_port);
+      g_tpg_running = 0U;
+      break;
+
+    case 'l': case 'L':
+      Console_ShowLinks();
+      break;
+
+    case 'h': case 'H': case '?':
+      Console_Help();
+      break;
+
+    default:
+      break;   /* ignore CR, LF and anything else */
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -218,9 +339,8 @@ int main(void)
          ip4addr_ntoa(netif_ip4_addr(&gnetif)),
          netif_is_link_up(&gnetif) ? "up" : "DOWN");
 
-  GSW145_Start1G_TrafficGenerator(0);
-
   UDP_Test_Init();
+  Console_Help();
 
   /* USER CODE END 2 */
 
@@ -237,6 +357,9 @@ int main(void)
     /* Drains the RX DMA, runs the LwIP timers, and calls
        ethernet_link_check_state() every 100 ms (a no-op on this board). */
     MX_LWIP_Process();
+
+    /* Non-blocking, so the LwIP polling above keeps its cadence. */
+    Console_Poll();
 
     if ((HAL_GetTick() - udp_tick) >= UDP_SEND_INTERVAL_MS)
     {
