@@ -1,0 +1,23 @@
+# STM32CubeIDE build output.
+# Everything under these directories is regenerated from the sources and the
+# .cproject, including the makefiles themselves, so there is nothing to keep.
+/Debug/
+/Release/
+
+# Build artifacts, wherever a build happens to drop them.
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+
+# Lock and backup files left behind by editors and Office-style applications
+# (the "~$" prefix), plus the usual OS clutter.
+~$*
+*~
+.DS_Store
+Thumbs.db
